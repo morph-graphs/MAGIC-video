@@ -136,10 +136,12 @@ def main():
 
     # Setup LLM
     from openai import OpenAI
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    # EPIC adapter: MAGIC_LLM_BASE_URL sends these calls to the local server (no paid API)
+    local = os.environ.get("MAGIC_LLM_BASE_URL")
+    api_key = "EMPTY" if local else os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
         sys.exit("OPENROUTER_API_KEY not set")
-    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=api_key)
+    client = OpenAI(base_url=local or "https://openrouter.ai/api/v1", api_key=api_key)
 
     for vid in video_ids:
         logger.info(f"=== Processing video {vid} ===")

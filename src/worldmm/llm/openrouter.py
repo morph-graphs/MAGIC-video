@@ -16,6 +16,32 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _repair_truncated_json(text: str) -> Any:
+    """EPIC adapter: parse a JSON answer cut off by max_tokens by closing it after its last complete element."""
+    ends = [i for i, ch in enumerate(text) if ch in "]}"]
+    for end in reversed(ends[-400:]):
+        prefix, stack, in_str, esc = text[: end + 1], [], False, False
+        for ch in prefix:
+            if in_str:
+                esc = (ch == "\\") and not esc
+                if ch == '"' and not esc:
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch in "[{":
+                stack.append(ch)
+            elif ch in "]}" and stack:
+                stack.pop()
+        if in_str:
+            continue
+        try:
+            return json.loads(prefix + "".join("]" if c == "[" else "}" for c in reversed(stack)))
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("unrepairable truncated JSON", text, 0)
+
+
 class OpenRouterModel:
     """
     OpenRouter model wrapper that provides the same interface as OpenAIModel.
@@ -35,12 +61,13 @@ class OpenRouterModel:
             max_retries: Maximum number of retry attempts
             **kwargs: Additional arguments
         """
-        api_key = os.environ["OPENROUTER_API_KEY"]
-
-        self.client = OpenAI(
-            api_key=api_key,
-            base_url="https://openrouter.ai/api/v1"
-        )
+        # EPIC adapter: MAGIC_LLM_BASE_URL points every LLM call (retriever, responder, time parser,
+        # preprocessing) at the local server (epic/hf_server.py) serving the backbone as MAGIC_LLM_MODEL; no paid API.
+        local = os.environ.get("MAGIC_LLM_BASE_URL")
+        if local:
+            self.client = OpenAI(api_key="EMPTY", base_url=local, timeout=1800)
+        else:
+            self.client = OpenAI(api_key=os.environ["OPENROUTER_API_KEY"], base_url="https://openrouter.ai/api/v1")
 
         self.model_name = model_name
         self.max_retries = max(1, max_retries)
@@ -57,7 +84,30 @@ class OpenRouterModel:
 
     def _parse_structured_response(self, response_text: str, text_format: type) -> Any:
         cleaned = self._extract_json_block(response_text)
-        json_data = json.loads(cleaned)
+        try:
+            json_data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            if not os.environ.get("MAGIC_LLM_BASE_URL"):
+                raise
+            json_data = _repair_truncated_json(cleaned)
+        # EPIC adapter, lenient parsing for local backbones: a bare JSON list for a schema with one
+        # field is that field (the NER prompt literally asks for "a JSON list"), and triples with a
+        # null element are dropped instead of failing the whole passage.
+        fields = list(getattr(text_format, "model_fields", {}))
+        if isinstance(json_data, list) and len(fields) == 1:
+            json_data = {fields[0]: json_data}
+        if isinstance(json_data, dict) and isinstance(json_data.get("triples"), list):
+            json_data["triples"] = [t for t in json_data["triples"]
+                                    if isinstance(t, list) and all(isinstance(x, str) for x in t)]
+        if isinstance(json_data, dict) and isinstance(json_data.get("semantic_triples"), list):
+            # keep (triple, evidence) pairs whose triple is 3 strings; evidence missing after a cut-off -> []
+            ev = json_data.get("episodic_evidence") or []
+            ev = ev + [[]] * (len(json_data["semantic_triples"]) - len(ev))
+            pairs = [(t, [i for i in e if isinstance(i, int)] if isinstance(e, list) else [])
+                     for t, e in zip(json_data["semantic_triples"], ev)
+                     if isinstance(t, list) and len(t) == 3 and all(isinstance(x, str) for x in t)]
+            json_data["semantic_triples"] = [t for t, _ in pairs]
+            json_data["episodic_evidence"] = [e for _, e in pairs]
 
         if hasattr(text_format, "model_validate"):
             return text_format.model_validate(json_data)
@@ -164,8 +214,14 @@ class OpenRouterModel:
         if extra_body:
             merged_kwargs["extra_body"] = extra_body
 
+        if os.environ.get("MAGIC_LLM_BASE_URL"):
+            # local backbone: non-thinking mode (Qwen3.8), seeded sampling, bounded output length
+            eb = merged_kwargs.setdefault("extra_body", {})
+            eb.setdefault("chat_template_kwargs", {"enable_thinking": False})
+            merged_kwargs.setdefault("seed", int(os.environ.get("MAGIC_SEED", "0")))
+            merged_kwargs.setdefault("max_tokens", int(os.environ.get("MAGIC_MAX_TOKENS", "4096")))
         response = self.client.chat.completions.create(
-            model=self.model_name,
+            model=os.environ.get("MAGIC_LLM_MODEL", self.model_name),
             messages=messages,
             **merged_kwargs,
         )
