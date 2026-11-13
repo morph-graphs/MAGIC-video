@@ -23,8 +23,11 @@ def _repair_truncated_json(text: str) -> Any:
         prefix, stack, in_str, esc = text[: end + 1], [], False, False
         for ch in prefix:
             if in_str:
-                esc = (ch == "\\") and not esc
-                if ch == '"' and not esc:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
                     in_str = False
                 continue
             if ch == '"':
