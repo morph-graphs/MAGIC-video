@@ -81,6 +81,7 @@ from .utils import (
 )
 from .unified import UnifiedMemory
 from .unified.nodes import NodeType
+from .unified.retrieval import walk_trace
 
 logger = logging.getLogger(__name__)
 
@@ -1056,6 +1057,7 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
         retrieved_items: List[RetrievedItem] = []
         retrieved_node_ids: Set[str] = set()
         round_history: List[Dict[str, Any]] = []
+        trace: List[Dict[str, Any]] = []      # EPIC-Morph port: each search's graph walk (logging only)
         total_visual_frames: int = 0          # cross-round frame budget tracker
         MAX_TOTAL_FRAMES: int = self.MAX_QA_FRAMES  # respect no-images setting
 
@@ -1129,6 +1131,8 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
                     t_start, t_end = time_ref
                     logger.info(f"[unified] Temporal retrieval: {t_start:.0f}s - {t_end:.0f}s")
                     content = self.retrieve_by_time(t_start, t_end)
+                    trace.append({"step": round_num, "query": search_query, "kind": "temporal",
+                                  "span": [float(t_start), float(t_end)], "found": bool(content)})
                     if content:
                         retrieved_items.append(RetrievedItem(
                             memory_type="episodic",
@@ -1169,6 +1173,15 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
                 ]
                 for n, _ in new_results:
                     retrieved_node_ids.add(n.id)
+                try:   # logging must never change the answer
+                    walk = walk_trace(raw_results)
+                except Exception as e:
+                    walk = {"error": f"{type(e).__name__}: {e}"[:200]}
+                step = {"step": round_num, "query": search_query, "kind": "unified", **walk}
+                fresh = {n.id for n, _ in new_results}
+                for d in step.get("nodes", []):
+                    d["new"] = d["id"] in fresh   # False: retrieved in an earlier round, not shown again
+                trace.append(step)
 
                 if not new_results:
                     logger.info("[unified] Retrieved: [No new results]")
@@ -1327,6 +1340,9 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
                     if chain_facts:
                         for cf in chain_facts:
                             injected_chain_facts.add((cf.get("label",""), cf.get("time",""), cf.get("fact","")))
+                        step["chains"] = [{"type": cf.get("chain_type", "topic"), "label": str(cf.get("label") or "")[:80],
+                                           "time": cf.get("time", ""), "end": cf.get("end_time", "")}
+                                          for cf in chain_facts[:30]]   # the chain facts shown, at most 30
                     if chain_facts:
                         # Mix facts into text_parts by time
                         if len(_bids) > 1:
@@ -1466,6 +1482,7 @@ Step 2 (only if search): Pick one memory type (episodic/semantic/visual) and for
             retrieved_items = retrieved_items,
             round_history   = round_history,
             num_rounds      = round_num,
+            trace           = trace,
         )
 
     def reset(self) -> None:

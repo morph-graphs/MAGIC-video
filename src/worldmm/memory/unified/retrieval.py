@@ -3,13 +3,14 @@ Cross-modal Personalized PageRank retrieval over the unified multimodal graph.
 """
 
 import logging
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .nodes import GraphNode, NodeType
+from .nodes import GraphNode, NodeType, ts_to_seconds
 from .graph import MultimodalGraph
 
 logger = logging.getLogger(__name__)
@@ -211,7 +212,52 @@ def _baseline_retrieve(
             results.append((node, hybrid))
 
     results.sort(key=lambda x: -x[1])
+    _last.__dict__.update(graph=graph, reset=reset, ppr=ppr_scores, sims=text_sims)   # EPIC-Morph port: for walk_trace
     return _multiscale_filter(results, top_k)
+
+
+# ======================================================================
+# EPIC-Morph port: what the last retrieval walked (logging only)
+# ======================================================================
+
+_last = threading.local()   # per thread: run_qa answers a cutoff group's questions in parallel threads
+MAX_SEEDS, MAX_EDGES, LABEL = 10, 60, 80   # caps of one trace step: seed nodes, edges, label characters
+
+
+def _node_info(node, idx=None):
+    d = {"id": node.id, "type": node.node_type.value, "label": (node.text or "")[:LABEL]}
+    if node.node_type == NodeType.EPISODE:
+        d["gran"] = node.metadata.get("granularity", "")
+    if node.node_type != NodeType.SEMANTIC:   # a semantic node's time is its consolidation snapshot, not evidence
+        d["t"] = [ts_to_seconds(node.start_ts), ts_to_seconds(node.end_ts)]
+    return d
+
+
+def walk_trace(results):
+    """The last cross_modal_retrieve call of this thread, compactly: its PPR seeds (the top MAX_SEEDS entries of
+    the reset vector), the returned nodes with their PPR score, query similarity and the hybrid score that ranked
+    them, and the graph edges among seeds and returned nodes (the subgraph PPR spread through; at most MAX_EDGES).
+    Times are seconds of the video; an entity's are its first and last sighting in the whole memory (filter_by_time
+    keeps an entity first seen by the cutoff, so its last sighting can be later). Empty when this thread has not
+    retrieved."""
+    g = getattr(_last, "graph", None)
+    if g is None:
+        return {}
+    reset, ppr, sims = _last.reset, _last.ppr, _last.sims
+    _last.__dict__.clear()   # read once: a later failed retrieval never shows this one's walk
+    seeds = [int(i) for i in np.argsort(-reset)[:MAX_SEEDS] if reset[i] > 0]
+    out = {"seeds": [{**_node_info(g.nodes[g._idx_to_node_id[i]]), "w": round(float(reset[i]), 4)} for i in seeds],
+           "nodes": []}
+    hit = []
+    for node, score in results:
+        i = g._node_id_to_idx[node.id]
+        hit.append(i)
+        out["nodes"].append({**_node_info(node), "ppr": round(float(ppr[i]), 6),
+                             "sim": round(float(sims[i]), 4) if sims is not None else None, "score": round(float(score), 6)})
+    edges = list(g._ig.es.select(_within=sorted(set(seeds) | set(hit))))
+    out["edges"] = [[g._idx_to_node_id[e.source], e["edge_type"], g._idx_to_node_id[e.target]] for e in edges[:MAX_EDGES]]
+    out["n_edges"] = len(edges)
+    return out
 
 
 # ======================================================================
